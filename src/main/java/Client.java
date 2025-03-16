@@ -8,6 +8,8 @@ import java.util.Scanner;
 
 public class Client {
     private final DatagramSocket socket;
+
+    private DatagramPacket receivedPacket;
     private InetAddress address;
     private byte[] buffer = new byte[516];
 
@@ -19,6 +21,7 @@ public class Client {
     private final short ACK = 4;
     private final short ERROR = 5;
 
+    private File file;
     private String fileName;
     private final String path = "src/main/java/";
     private short request = -1;
@@ -68,13 +71,22 @@ public class Client {
     public void sendRequest() throws IOException {
         getUserRequest();
 
+        file = new File(path + fileName);
+        if (request == WRQ) {
+            if (!file.exists()) {
+                System.out.println("Could not locate file with name: '" + fileName + "' in " + path);
+                sendRequest();
+                return;
+            }
+        }
+
         // Create a request packet and send it to the server
         DatagramPacket requestPacket = constructRequestPacket(request, fileName, "octet", address, serverPort);
         socket.send(requestPacket);
         System.out.println("Sent request packet to server at port: " + serverPort);
 
         // Wait for server to send a packet back
-        DatagramPacket receivedPacket = new DatagramPacket(buffer, buffer.length);
+        receivedPacket = new DatagramPacket(buffer, buffer.length);
         socket.receive(receivedPacket);
 
         // Check TIDs match
@@ -82,143 +94,132 @@ public class Client {
             short receivedOpcode = parseOpcode(receivedPacket);
             System.out.println("Received opcode " + receivedOpcode + " from server at port: " + receivedPacket.getPort());
 
-            File file = new File(path + fileName);
-
-            if (request == RRQ) {
-                if (receivedOpcode == DATA) {
-                    System.out.println("Connection established");
-
-                    short blockNumber = 1;
-                    short receivedBlockNumber = parseBlockNumber(receivedPacket);
-
-                    DataOutputStream outputStream = new DataOutputStream(new FileOutputStream(file));
-
-                    // Write the first data packet that established a connection to the file
-                    outputStream.write(receivedPacket.getData(), 4, receivedPacket.getLength() - 4);
-
-                    // Then send and received the rest in a loop
-                    while (receivedPacket.getLength() >= 512) {
-                        // Send ACK packet to server with the same block number as the data packet
-                        DatagramPacket ACKPacket = constructACKPacket(receivedBlockNumber, requestPacket.getAddress(), requestPacket.getPort());
-                        socket.send(ACKPacket);
-                        System.out.println("Sent ACK packet with block number: " + receivedBlockNumber);
-
-                        socket.receive(receivedPacket);
-
-                        receivedOpcode = parseOpcode(receivedPacket);
-                        receivedBlockNumber = parseBlockNumber(receivedPacket);
-                        if (receivedOpcode == DATA && receivedBlockNumber == blockNumber + 1) {
-                            System.out.println("Success, received DATA packet with block number: " + receivedBlockNumber);
-                            outputStream.write(receivedPacket.getData(), 4, receivedPacket.getLength() - 4);
-                            blockNumber = receivedBlockNumber;
-                        }
-                        else {
-                            System.err.println("Received block number incorrect, duplicate packet?");
-                        }
-                    }
-
-                    System.out.println("Finished reading file from server.");
-                    outputStream.close();
-                    close();
-                }
-                else if (receivedOpcode == ERROR) {
-                    // TODO handle this error, which would be file not found error because thats the only error I have to handle
-                }
+            if (receivedOpcode == DATA && request == RRQ) {
+                System.out.println("Connection established");
+                CompleteReadRequest();
             }
-            else if (request == WRQ) {
-                if (receivedOpcode == ACK) {
-                    System.out.println("Connection established");
-
-                    FileInputStream inputStream;
-                    try {
-                        inputStream = new FileInputStream(file);
-                    } catch (FileNotFoundException e) {
-                        System.err.println("Requested file not found. Sending error packet.");
-                        // TODO construct and send error packet
-                        return;
-                    }
-
-                    byte[] dataBuffer;
-                    int bytesRead;
-                    short blockNumber = parseBlockNumber(receivedPacket); // should be zero
-                    blockNumber++;
-
-                    while (true) {
-                        // Read up to 512 bytes from the file and store in the data buffer
-                        dataBuffer = new byte[512];
-                        bytesRead = inputStream.read(dataBuffer);
-
-                        if (bytesRead == -1) {
-                            dataBuffer = new byte[0];
-                        }
-                        else {
-                            dataBuffer = Arrays.copyOf(dataBuffer, bytesRead);
-                        }
-
-                        // Create a data packet from the data buffer and the current block number
-                        DatagramPacket DATAPacket = constructDataPacket(blockNumber, dataBuffer, receivedPacket.getAddress(), requestPacket.getPort());
-                        socket.send(DATAPacket);
-
-                        System.out.println("Sent DATA packet with block number: " + blockNumber + " and " + bytesRead + " bytes of data");
-
-                        if (bytesRead < 512) {
-                            System.out.println("Finished writing file to server.");
-                            inputStream.close();
-                            close();
-                            break;
-                        }
-
-                        receivedPacket = new DatagramPacket(buffer, buffer.length);
-                        socket.receive(receivedPacket);
-
-                        // check opcode and block number of received packet
-                        receivedOpcode = parseOpcode(receivedPacket);
-                        short receivedBlockNumber = parseBlockNumber(receivedPacket);
-                        if (receivedOpcode == ACK && receivedBlockNumber == blockNumber) {
-                            System.out.println("Success, received ACK packet with block number: " + receivedBlockNumber);
-                            blockNumber++;
-                        }
-                        else {
-                            System.err.println("Received unknown packet. Disregarding packet.");
-                        }
-                    }
-                }
-                else {
-                    System.err.println("Received unknown packet. Disregarding packet.");
-                    // TODO send another error?
-                }
+            else if (receivedOpcode == ACK && request == WRQ ) {
+                System.out.println("Connection established");
+                CompleteWriteRequest();
+            }
+            else if (receivedOpcode == ERROR) {
+                String errorMessage = parseErrorPacket(receivedPacket);
+                System.out.println("Received an error from server with message: '" + errorMessage + "'");
+                sendRequest();
+            }
+            else {
+                System.err.println("Received unknown packet. Disregarding packet.");
             }
         }
         else {
-            System.err.println("Received unknown packet. Disregarding packet.");
+            System.err.println("Received unknown packet from unknown port. Disregarding packet.");
         }
+    }
+
+    private void CompleteReadRequest() throws IOException {
+        short blockNumber = 1;
+        short receivedBlockNumber = parseBlockNumber(receivedPacket);
+
+        DataOutputStream outputStream = new DataOutputStream(new FileOutputStream(file));
+
+        // Write the first data packet that established a connection to the file
+        outputStream.write(receivedPacket.getData(), 4, receivedPacket.getLength() - 4);
+
+        // Then send and received the rest in a loop
+        while (receivedPacket.getLength() >= 512) {
+            // Send ACK packet to server with the same block number as the data packet
+            DatagramPacket ACKPacket = constructACKPacket(receivedBlockNumber, receivedPacket.getAddress(), receivedPacket.getPort());
+            socket.send(ACKPacket);
+            System.out.println("Sent ACK packet with block number: " + receivedBlockNumber);
+
+            socket.receive(receivedPacket);
+
+            receivedBlockNumber = parseBlockNumber(receivedPacket);
+            if (parseOpcode(receivedPacket) == DATA && receivedBlockNumber == blockNumber + 1) {
+                System.out.println("Success, received DATA packet with block number: " + receivedBlockNumber);
+                outputStream.write(receivedPacket.getData(), 4, receivedPacket.getLength() - 4);
+                blockNumber = receivedBlockNumber;
+            }
+            else {
+                System.err.println("Received block number incorrect, duplicate packet?");
+            }
+        }
+
+        System.out.println("Finished reading file from server.");
+        outputStream.close();
+        close();
+    }
+
+    private void CompleteWriteRequest() throws IOException {
+        FileInputStream inputStream = new FileInputStream(file);
+
+        byte[] dataBuffer;
+        int bytesRead;
+        short blockNumber = parseBlockNumber(receivedPacket); // should be zero
+        blockNumber++;
+
+        while (true) {
+            // Read up to 512 bytes from the file and store in the data buffer
+            dataBuffer = new byte[512];
+            bytesRead = inputStream.read(dataBuffer);
+
+            if (bytesRead == -1) {
+                dataBuffer = new byte[0];
+            }
+            else {
+                dataBuffer = Arrays.copyOf(dataBuffer, bytesRead);
+            }
+
+            // Create a data packet from the data buffer and the current block number
+            DatagramPacket DATAPacket = constructDataPacket(blockNumber, dataBuffer, receivedPacket.getAddress(), receivedPacket.getPort());
+            socket.send(DATAPacket);
+
+            System.out.println("Sent DATA packet with block number: " + blockNumber + " and " + bytesRead + " bytes of data");
+
+            if (bytesRead < 512) {
+                System.out.println("Finished writing file to server.");
+                inputStream.close();
+                close();
+                break;
+            }
+
+            receivedPacket = new DatagramPacket(buffer, buffer.length);
+            socket.receive(receivedPacket);
+
+            // check opcode and block number of received packet
+            short receivedBlockNumber = parseBlockNumber(receivedPacket);
+            if (parseOpcode(receivedPacket) == ACK && receivedBlockNumber == blockNumber) {
+                System.out.println("Success, received ACK packet with block number: " + receivedBlockNumber);
+                blockNumber++;
+            }
+            else {
+                System.err.println("Received unknown packet. Disregarding packet.");
+            }
+        }
+
     }
 
     /**
      * Creates a packet following the TFTP request packet format
-     * @param operation The type of request, (Read request or write request)
+     * @param opcode The type of request, (Read request or write request)
      * @param fileName The name of the file
      * @param mode The mode of transfer used by TFTP
      * @param address The address to send the packet to
      * @param port The port to send the packet to
      * @return A datagram packet
      */
-    private DatagramPacket constructRequestPacket(short operation, String fileName, String mode, InetAddress address, int port) throws IOException {
-        byte[] buffer;
-        byte[] opcode = new byte[2];
-        opcode[0] = (byte)((operation >> 8));
-        opcode[1] = (byte) operation;
+    private DatagramPacket constructRequestPacket(short opcode, String fileName, String mode, InetAddress address, int port) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-        out.write(opcode);
+        out.writeShort(opcode);
         out.write(fileName.getBytes());
         out.write(0);
         out.write(mode.getBytes());
         out.write(0);
-        buffer = out.toByteArray();
         out.close();
 
+        byte[] buffer = baos.toByteArray();
         return new DatagramPacket(buffer, buffer.length, address, port);
     }
 
@@ -278,8 +279,27 @@ public class Client {
         return byteBuffer.getShort(2);
     }
 
+    /**
+     * Reads the error message string contained in a TFTP error packet
+     * @param packet The TFTP packet
+     */
+    private String parseErrorPacket(DatagramPacket packet) {
+        byte[] buffer = packet.getData();
+
+        int delimiter = - 1;
+
+        // start at 4, because we know the first 2 bytes will contain opcode and the second 2 the error message
+        for (int i = 4; i < buffer.length; i++) {
+            if (buffer[i] == 0) { // loop until it finds first 0
+                delimiter = i;
+                break;
+            }
+        }
+
+        return new String(buffer, 4, delimiter - 4);
+    }
+
     public void close() {
         socket.close();
     }
 }
-
