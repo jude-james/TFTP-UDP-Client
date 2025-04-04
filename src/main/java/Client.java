@@ -11,15 +11,20 @@ public class Client {
 
     private DatagramPacket receivedPacket;
     private InetAddress address;
-    private byte[] buffer = new byte[516];
 
     private final int serverPort = 69;
+    private int connectionPort;
 
+    private byte[] buffer = new byte[516];
+
+    // 2 byte opcode / operation
     private final short RRQ = 1;
     private final short WRQ = 2;
     private final short DATA = 3;
     private final short ACK = 4;
     private final short ERROR = 5;
+
+    private final int timeoutTime = 2000;
 
     private File file;
     private String fileName;
@@ -92,7 +97,7 @@ public class Client {
         socket.send(requestPacket);
         System.out.println("Sent request packet to server at port: " + serverPort);
 
-        socket.setSoTimeout(2000);
+        socket.setSoTimeout(timeoutTime);
 
         // Wait for server to send a packet back
         receivedPacket = new DatagramPacket(buffer, buffer.length);
@@ -100,35 +105,29 @@ public class Client {
             socket.receive(receivedPacket);
         }
         catch (SocketTimeoutException e) {
-            System.out.println("Timeout. Resending packet");
-            // TODO retransmit
+            System.err.println("Timeout. Server may not be running.");
             return;
         }
 
-        // Check TIDs match
-        if (receivedPacket.getPort() == serverPort) {
-            short receivedOpcode = parseOpcode(receivedPacket);
-            System.out.println("Received opcode " + receivedOpcode + " from server at port: " + receivedPacket.getPort());
+        connectionPort = receivedPacket.getPort();
+        short receivedOpcode = parseOpcode(receivedPacket);
+        System.out.println("Received opcode " + receivedOpcode + " from server at port: " + connectionPort);
 
-            if (receivedOpcode == DATA && request == RRQ) {
-                System.out.println("Connection established");
-                CompleteReadRequest();
-            }
-            else if (receivedOpcode == ACK && request == WRQ ) {
-                System.out.println("Connection established");
-                CompleteWriteRequest();
-            }
-            else if (receivedOpcode == ERROR) {
-                String errorMessage = parseErrorPacket(receivedPacket);
-                System.out.println("Received an error from server with message: '" + errorMessage + "'");
-                sendRequest();
-            }
-            else {
-                System.err.println("Received unknown packet. Disregarding packet.");
-            }
+        if (receivedOpcode == DATA && request == RRQ) {
+            System.out.println("Connection established");
+            CompleteReadRequest();
+        }
+        else if (receivedOpcode == ACK && request == WRQ ) {
+            System.out.println("Connection established");
+            CompleteWriteRequest();
+        }
+        else if (receivedOpcode == ERROR) {
+            String errorMessage = parseErrorPacket(receivedPacket);
+            System.out.println("Received an error from server with message: '" + errorMessage + "'");
+            sendRequest();
         }
         else {
-            System.err.println("Received packet from unknown port. Disregarding packet.");
+            System.err.println("Received unknown packet. Disregarding packet.");
         }
     }
 
@@ -151,10 +150,18 @@ public class Client {
             socket.send(ACKPacket);
             System.out.println("Sent ACK packet with block number: " + receivedBlockNumber);
 
-            socket.receive(receivedPacket);
+            socket.setSoTimeout(timeoutTime);
+
+            try {
+                socket.receive(receivedPacket);
+            }
+            catch (SocketTimeoutException e) {
+                System.err.println("Timeout occurred. Retransmitting packet.");
+                continue;
+            }
 
             // Check TIDs match and block number is correct
-            if (receivedPacket.getPort() == serverPort) {
+            if (receivedPacket.getPort() == connectionPort) {
                 receivedBlockNumber = parseBlockNumber(receivedPacket);
                 if (parseOpcode(receivedPacket) == DATA && receivedBlockNumber == blockNumber + 1) {
                     System.out.println("Success, received DATA packet with block number: " + receivedBlockNumber);
@@ -163,7 +170,6 @@ public class Client {
                 }
                 else {
                     System.err.println("Received unknown packet or incorrect block number. Disregarding packet and retransmitting ACK packet...");
-                    // TODO resend packet, in this case it should be simple, just go to top of loop again, and keep block number same?
                 }
             }
             else {
@@ -173,7 +179,7 @@ public class Client {
 
         System.out.println("Finished reading file from server.");
         outputStream.close();
-        close();
+        socket.close();
     }
 
     /**
@@ -203,20 +209,28 @@ public class Client {
             DatagramPacket DATAPacket = constructDataPacket(blockNumber, dataBuffer, receivedPacket.getAddress(), receivedPacket.getPort());
             socket.send(DATAPacket);
 
+            socket.setSoTimeout(timeoutTime);
+
             System.out.println("Sent DATA packet with block number: " + blockNumber + " and " + bytesRead + " bytes of data");
 
             if (bytesRead < 512) {
                 System.out.println("Finished writing file to server.");
                 inputStream.close();
-                close();
+                socket.close();
                 break;
             }
 
             receivedPacket = new DatagramPacket(buffer, buffer.length);
-            socket.receive(receivedPacket);
+            try {
+                socket.receive(receivedPacket);
+            }
+            catch (SocketTimeoutException e) {
+                System.err.println("Timeout occurred. Retransmitting packet.");
+                socket.send(DATAPacket);
+            }
 
             // Check TIDs match and block number is correct
-            if (receivedPacket.getPort() == serverPort) {
+            if (receivedPacket.getPort() == connectionPort) {
                 short receivedBlockNumber = parseBlockNumber(receivedPacket);
                 if (parseOpcode(receivedPacket) == ACK && receivedBlockNumber == blockNumber) {
                     System.out.println("Success, received ACK packet with block number: " + receivedBlockNumber);
@@ -224,7 +238,7 @@ public class Client {
                 }
                 else {
                     System.err.println("Received unknown packet or incorrect block number. Disregarding packet and retransmitting DATA packet...");
-                    // TODO retransmit
+                    socket.send(DATAPacket);
                 }
             }
             else {
@@ -332,9 +346,5 @@ public class Client {
         }
 
         return new String(buffer, 4, delimiter - 4);
-    }
-
-    public void close() {
-        socket.close();
     }
 }
