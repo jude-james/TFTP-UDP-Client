@@ -144,7 +144,7 @@ public class Client {
         outputStream.write(receivedPacket.getData(), 4, receivedPacket.getLength() - 4);
 
         // Then send and received the rest in a loop
-        while (receivedPacket.getLength() >= 512) {
+        while (receivedPacket.getLength() >= 516) {
             // Send ACK packet to server with the same block number as the data packet
             DatagramPacket ACKPacket = constructACKPacket(receivedBlockNumber, receivedPacket.getAddress(), receivedPacket.getPort());
             socket.send(ACKPacket);
